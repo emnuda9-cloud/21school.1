@@ -110,19 +110,35 @@ def volume_to_slices(case: dict, require_flair: bool):
     mask = load_volume(case["mask"])
     flair = load_volume(case["flair"]) if require_flair else None
 
-    n_slices = dwi.shape[-1]
+    volumes = [dwi, adc, mask] + ([flair] if require_flair else [])
+    n_slices = min(v.shape[-1] for v in volumes)
+    if len({v.shape[-1] for v in volumes}) > 1:
+        print(f"[внимание] {case['case_id']}: у модальностей разное число срезов "
+              f"({[v.shape[-1] for v in volumes]}) — беру первые {n_slices}")
+
     slices = []
     for i in range(n_slices):
-        m = (mask[..., i] > 0).astype(np.uint8)
+        dwi_slice, adc_slice = dwi[..., i], adc[..., i]
+        mask_slice = (mask[..., i] > 0).astype(np.uint8)
+        flair_slice = flair[..., i] if require_flair else None
+
         # пропускаем пустые срезы без мозга (только фон/шум по краям тома)
-        if dwi[..., i].std() < 1e-6:
+        if dwi_slice.std() < 1e-6:
             continue
+        # пропускаем срез, если у модальностей не совпадает разрешение в плоскости
+        # (значит, тома не приведены к одной сетке — такой срез использовать нельзя)
+        shapes = {dwi_slice.shape, adc_slice.shape, mask_slice.shape}
+        if flair_slice is not None:
+            shapes.add(flair_slice.shape)
+        if len(shapes) > 1:
+            continue
+
         slices.append({
             "case_id": case["case_id"],
-            "dwi": dwi[..., i],
-            "adc": adc[..., i],
-            "flair": flair[..., i] if require_flair else None,
-            "mask": m,
+            "dwi": dwi_slice,
+            "adc": adc_slice,
+            "flair": flair_slice,
+            "mask": mask_slice,
         })
     return slices
 
