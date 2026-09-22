@@ -1,17 +1,16 @@
 """
-ML baseline: классический классификатор (RandomForest) на признаках
-DWI/ADC для сегментации ишемических очагов.
+ML baseline с тремя модальностями: DWI + ADC + FLAIR.
 
-Место в иерархии сложности:
-    1) Пороговая сегментация (threshold_baseline.py)   -- эвристика, 0 обучения
-    2) ЭТОТ ФАЙЛ: RandomForest на пиксельных признаках -- классический ML
-    3) Dual-encoder U-Net (dual_encoder_unet.py)        -- глубокое обучение
+Зачем нужен FLAIR:
+  При ишемическом инсульте DWI "загорается" почти сразу (минуты),
+  а FLAIR — только через несколько часов. Несовпадение (DWI-FLAIR
+  mismatch: очаг виден на DWI, но НЕ виден на FLAIR) — стандартный
+  клинический признак того, что инсульт свежий (<4.5 ч), а значит
+  пациенту можно проводить тромболизис. Это ровно то, на чём строится
+  Brainomix DWI-FLAIR mismatch (см. анализ аналогов).
 
-Каждый пиксель описывается вектором признаков (интенсивность + локальный
-контекст), классификатор учится отделять "ишемия" / "не ишемия".
-Такой baseline — обязательная строка сравнения в любой работе, где
-заявляется "мы использовали CNN": нужно показать, что CNN действительно
-даёт прирост над классическим ML, а не только над наивным порогом.
+Модель без FLAIR в принципе не может отличить свежий очаг от старого —
+а это критично важно клинически, даже если геометрия маски та же самая.
 
 Зависимости: numpy, scipy, scikit-learn (все уже установлены).
 """
@@ -19,73 +18,100 @@ DWI/ADC для сегментации ишемических очагов.
 import numpy as np
 from scipy import ndimage
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score
 
 
 # ---------------------------------------------------------------------------
-# Извлечение признаков
+# Извлечение признаков (DWI + ADC + FLAIR)
 # ---------------------------------------------------------------------------
 
-def extract_features(dwi: np.ndarray, adc: np.ndarray, window: int = 5) -> np.ndarray:
+def _local_stats(img: np.ndarray, window: int):
+    mean = ndimage.uniform_filter(img, size=window)
+    mean_sq = ndimage.uniform_filter(img ** 2, size=window)
+    std = np.sqrt(np.clip(mean_sq - mean ** 2, 0, None))
+    return mean, std
+
+
+def extract_features(dwi: np.ndarray, adc: np.ndarray, flair: np.ndarray,
+                      window: int = 5) -> np.ndarray:
     """
-    Для каждого пикселя строит вектор признаков:
-    [DWI, ADC, локальное среднее DWI, локальное std DWI,
-     локальное среднее ADC, локальное std ADC, градиент ADC]
+    Признаки на пиксель:
+    [DWI, ADC, FLAIR,
+     DWI_mean, DWI_std, ADC_mean, ADC_std, FLAIR_mean, FLAIR_std,
+     DWI_FLAIR_mismatch]
 
-    Локальный контекст (среднее/std в окне) — это то, чего не хватает
-    пороговому baseline: он смотрит только на значение самого пикселя.
+    DWI_FLAIR_mismatch = локальный DWI (нормированный) минус локальный
+    FLAIR (нормированный) — высокое значение означает "виден на DWI,
+    не виден на FLAIR" = вероятно свежий инфаркт.
     """
-    mean_dwi = ndimage.uniform_filter(dwi, size=window)
-    mean_dwi_sq = ndimage.uniform_filter(dwi ** 2, size=window)
-    std_dwi = np.sqrt(np.clip(mean_dwi_sq - mean_dwi ** 2, 0, None))
+    mean_dwi, std_dwi = _local_stats(dwi, window)
+    mean_adc, std_adc = _local_stats(adc, window)
+    mean_flair, std_flair = _local_stats(flair, window)
 
-    mean_adc = ndimage.uniform_filter(adc, size=window)
-    mean_adc_sq = ndimage.uniform_filter(adc ** 2, size=window)
-    std_adc = np.sqrt(np.clip(mean_adc_sq - mean_adc ** 2, 0, None))
-
-    grad_adc = ndimage.generic_gradient_magnitude(adc, ndimage.sobel)
+    dwi_norm = (dwi - dwi.mean()) / (dwi.std() + 1e-6)
+    flair_norm = (flair - flair.mean()) / (flair.std() + 1e-6)
+    mismatch = dwi_norm - flair_norm
 
     stacked = np.stack(
-        [dwi, adc, mean_dwi, std_dwi, mean_adc, std_adc, grad_adc], axis=-1
+        [dwi, adc, flair, mean_dwi, std_dwi, mean_adc, std_adc,
+         mean_flair, std_flair, mismatch],
+        axis=-1,
     )
     return stacked.reshape(-1, stacked.shape[-1])
 
 
-FEATURE_NAMES = ["DWI", "ADC", "DWI_local_mean", "DWI_local_std",
-                 "ADC_local_mean", "ADC_local_std", "ADC_gradient"]
+FEATURE_NAMES = ["DWI", "ADC", "FLAIR", "DWI_mean", "DWI_std",
+                 "ADC_mean", "ADC_std", "FLAIR_mean", "FLAIR_std",
+                 "DWI_FLAIR_mismatch"]
 
 
 # ---------------------------------------------------------------------------
-# Метрики (те же, что и в остальных baseline — сравнение честное)
+# Метрики
 # ---------------------------------------------------------------------------
 
-def dice_coefficient(pred: np.ndarray, target: np.ndarray, eps: float = 1e-6) -> float:
+def dice_coefficient(pred, target, eps=1e-6):
     pred, target = pred.astype(bool), target.astype(bool)
     intersection = np.logical_and(pred, target).sum()
     return (2 * intersection + eps) / (pred.sum() + target.sum() + eps)
 
 
-def iou_score(pred: np.ndarray, target: np.ndarray, eps: float = 1e-6) -> float:
+def iou_score(pred, target, eps=1e-6):
     pred, target = pred.astype(bool), target.astype(bool)
     intersection = np.logical_and(pred, target).sum()
     union = np.logical_or(pred, target).sum()
     return (intersection + eps) / (union + eps)
 
 
-# ---------------------------------------------------------------------------
-# Наивный пороговый baseline (для сравнения на тех же случаях)
-# ---------------------------------------------------------------------------
+def find_best_threshold(proba_maps, masks, candidates=None):
+    """
+    Подбирает порог по вероятности, максимизирующий средний Dice
+    на валидационном наборе (НЕ на тесте — иначе будет утечка).
+    """
+    if candidates is None:
+        candidates = np.arange(0.1, 0.95, 0.05)
 
-def segment_by_threshold(dwi, adc, adc_percentile=15.0, dwi_percentile=85.0):
-    adc_thresh = np.percentile(adc, adc_percentile)
-    dwi_thresh = np.percentile(dwi, dwi_percentile)
-    return ((adc < adc_thresh) & (dwi > dwi_thresh)).astype(np.uint8)
+    best_threshold, best_dice = 0.5, -1.0
+    for t in candidates:
+        scores = [
+            dice_coefficient((p > t).astype(np.uint8), m)
+            for p, m in zip(proba_maps, masks)
+        ]
+        mean_dice = np.mean(scores)
+        if mean_dice > best_dice:
+            best_dice, best_threshold = mean_dice, t
+    return best_threshold, best_dice
 
 
 # ---------------------------------------------------------------------------
-# Синтетические данные с варьирующимся контрастом (реалистичнее для сравнения)
+# Синтетические данные: DWI + ADC + FLAIR, с "возрастом" инсульта
 # ---------------------------------------------------------------------------
 
 def make_synthetic_case(size: int = 128, seed: int = 0):
+    """
+    Возвращает dwi, adc, flair, mask, is_acute.
+    is_acute=True  -> очаг свежий: виден на DWI, почти не виден на FLAIR
+    is_acute=False -> очаг старше: виден и на DWI, и на FLAIR
+    """
     rng = np.random.default_rng(seed)
 
     yy, xx = np.mgrid[0:size, 0:size]
@@ -97,13 +123,21 @@ def make_synthetic_case(size: int = 128, seed: int = 0):
 
     dwi = rng.normal(loc=100, scale=8, size=(size, size))
     adc = rng.normal(loc=800, scale=40, size=(size, size))
+    flair = rng.normal(loc=300, scale=20, size=(size, size))
 
-    # контраст очага варьируется от случая к случаю (слабый/сильный инсульт)
     contrast = rng.uniform(0.4, 1.0)
     dwi[lesion] += rng.normal(loc=60 * contrast, scale=10, size=lesion.sum())
     adc[lesion] -= rng.normal(loc=350 * contrast, scale=30, size=lesion.sum())
 
-    return dwi, adc, lesion.astype(np.uint8)
+    is_acute = rng.random() < 0.5
+    if is_acute:
+        # свежий инфаркт: FLAIR почти не реагирует (лёгкий шум)
+        flair[lesion] += rng.normal(loc=5, scale=5, size=lesion.sum())
+    else:
+        # более старый инфаркт: FLAIR тоже "загорается"
+        flair[lesion] += rng.normal(loc=80 * contrast, scale=15, size=lesion.sum())
+
+    return dwi, adc, flair, lesion.astype(np.uint8), is_acute
 
 
 # ---------------------------------------------------------------------------
@@ -111,17 +145,16 @@ def make_synthetic_case(size: int = 128, seed: int = 0):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    N_TRAIN_CASES = 12
-    N_TEST_CASES = 6
+    N_TRAIN, N_VAL, N_TEST = 16, 6, 8
 
-    # --- обучающая выборка ---
-    train_features, train_labels = [], []
-    for seed in range(N_TRAIN_CASES):
-        dwi, adc, mask = make_synthetic_case(seed=seed)
-        train_features.append(extract_features(dwi, adc))
-        train_labels.append(mask.reshape(-1))
-    X_train = np.concatenate(train_features, axis=0)
-    y_train = np.concatenate(train_labels, axis=0)
+    # --- обучение ---
+    X_train, y_train = [], []
+    for seed in range(N_TRAIN):
+        dwi, adc, flair, mask, _ = make_synthetic_case(seed=seed)
+        X_train.append(extract_features(dwi, adc, flair))
+        y_train.append(mask.reshape(-1))
+    X_train = np.concatenate(X_train, axis=0)
+    y_train = np.concatenate(y_train, axis=0)
 
     clf = RandomForestClassifier(
         n_estimators=150, max_depth=10, class_weight="balanced",
@@ -129,27 +162,51 @@ if __name__ == "__main__":
     )
     clf.fit(X_train, y_train)
 
-    # --- важность признаков ---
     print("Важность признаков:")
     for name, imp in sorted(zip(FEATURE_NAMES, clf.feature_importances_),
                              key=lambda t: -t[1]):
-        print(f"  {name:16s} {imp:.3f}")
+        print(f"  {name:20s} {imp:.3f}")
 
-    # --- тестовая выборка: сравнение ML vs порог ---
-    ml_dice, ml_iou, thr_dice, thr_iou = [], [], [], []
-    for seed in range(1000, 1000 + N_TEST_CASES):
-        dwi, adc, mask = make_synthetic_case(seed=seed)
+    # --- валидация: получаем карты вероятностей, подбираем порог ---
+    val_proba, val_masks = [], []
+    for seed in range(500, 500 + N_VAL):
+        dwi, adc, flair, mask, _ = make_synthetic_case(seed=seed)
+        feats = extract_features(dwi, adc, flair)
+        proba = clf.predict_proba(feats)[:, 1].reshape(mask.shape)  # P(ишемия)
+        val_proba.append(proba)
+        val_masks.append(mask)
 
-        feats = extract_features(dwi, adc)
-        pred_ml = clf.predict(feats).reshape(mask.shape)
-        pred_thr = segment_by_threshold(dwi, adc)
+    best_threshold, best_val_dice = find_best_threshold(val_proba, val_masks)
+    print(f"\nЛучший порог по вероятности (подобран на валидации): {best_threshold:.2f}")
+    print(f"  Dice на валидации при этом пороге: {best_val_dice:.3f}")
 
-        ml_dice.append(dice_coefficient(pred_ml, mask))
-        ml_iou.append(iou_score(pred_ml, mask))
-        thr_dice.append(dice_coefficient(pred_thr, mask))
-        thr_iou.append(iou_score(pred_thr, mask))
+    # --- тест: применяем predict_proba + подобранный порог, а не predict() ---
+    dice_scores, iou_scores, auc_scores = [], [], []
+    mismatch_acute, mismatch_chronic = [], []
 
-    print(f"\nТестовых случаев: {N_TEST_CASES}")
-    print(f"{'Метод':20s} {'Dice':>8s} {'IoU':>8s}")
-    print(f"{'Порог (наивный)':20s} {np.mean(thr_dice):8.3f} {np.mean(thr_iou):8.3f}")
-    print(f"{'RandomForest (ML)':20s} {np.mean(ml_dice):8.3f} {np.mean(ml_iou):8.3f}")
+    for seed in range(1000, 1000 + N_TEST):
+        dwi, adc, flair, mask, is_acute = make_synthetic_case(seed=seed)
+        feats = extract_features(dwi, adc, flair)
+
+        proba = clf.predict_proba(feats)[:, 1]           # вероятность класса "ишемия"
+        pred = (proba > best_threshold).astype(np.uint8).reshape(mask.shape)
+
+        dice_scores.append(dice_coefficient(pred, mask))
+        iou_scores.append(iou_score(pred, mask))
+        # AUC не зависит от порога — оценивает качество самой вероятности
+        auc_scores.append(roc_auc_score(mask.reshape(-1), proba))
+
+        mismatch_map = feats[:, FEATURE_NAMES.index("DWI_FLAIR_mismatch")].reshape(mask.shape)
+        avg_mismatch = mismatch_map[mask.astype(bool)].mean()
+        (mismatch_acute if is_acute else mismatch_chronic).append(avg_mismatch)
+
+    print(f"\nСегментация (DWI+ADC+FLAIR, predict_proba > {best_threshold:.2f}), "
+          f"{N_TEST} тестовых случаев:")
+    print(f"  Dice: {np.mean(dice_scores):.3f}")
+    print(f"  IoU:  {np.mean(iou_scores):.3f}")
+    print(f"  ROC-AUC (без привязки к порогу): {np.mean(auc_scores):.3f}")
+
+    print("\nDWI-FLAIR mismatch внутри очага (маркер свежести инсульта):")
+    print(f"  Свежие очаги   (acute):    среднее mismatch = {np.mean(mismatch_acute):.2f}")
+    print(f"  Не свежие очаги (chronic): среднее mismatch = {np.mean(mismatch_chronic):.2f}")
+    print("  (чем выше значение — тем более вероятен свежий инфаркт, окно для тромболизиса)")
