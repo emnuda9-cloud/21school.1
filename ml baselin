@@ -1,0 +1,155 @@
+"""
+ML baseline: классический классификатор (RandomForest) на признаках
+DWI/ADC для сегментации ишемических очагов.
+
+Место в иерархии сложности:
+    1) Пороговая сегментация (threshold_baseline.py)   -- эвристика, 0 обучения
+    2) ЭТОТ ФАЙЛ: RandomForest на пиксельных признаках -- классический ML
+    3) Dual-encoder U-Net (dual_encoder_unet.py)        -- глубокое обучение
+
+Каждый пиксель описывается вектором признаков (интенсивность + локальный
+контекст), классификатор учится отделять "ишемия" / "не ишемия".
+Такой baseline — обязательная строка сравнения в любой работе, где
+заявляется "мы использовали CNN": нужно показать, что CNN действительно
+даёт прирост над классическим ML, а не только над наивным порогом.
+
+Зависимости: numpy, scipy, scikit-learn (все уже установлены).
+"""
+
+import numpy as np
+from scipy import ndimage
+from sklearn.ensemble import RandomForestClassifier
+
+
+# ---------------------------------------------------------------------------
+# Извлечение признаков
+# ---------------------------------------------------------------------------
+
+def extract_features(dwi: np.ndarray, adc: np.ndarray, window: int = 5) -> np.ndarray:
+    """
+    Для каждого пикселя строит вектор признаков:
+    [DWI, ADC, локальное среднее DWI, локальное std DWI,
+     локальное среднее ADC, локальное std ADC, градиент ADC]
+
+    Локальный контекст (среднее/std в окне) — это то, чего не хватает
+    пороговому baseline: он смотрит только на значение самого пикселя.
+    """
+    mean_dwi = ndimage.uniform_filter(dwi, size=window)
+    mean_dwi_sq = ndimage.uniform_filter(dwi ** 2, size=window)
+    std_dwi = np.sqrt(np.clip(mean_dwi_sq - mean_dwi ** 2, 0, None))
+
+    mean_adc = ndimage.uniform_filter(adc, size=window)
+    mean_adc_sq = ndimage.uniform_filter(adc ** 2, size=window)
+    std_adc = np.sqrt(np.clip(mean_adc_sq - mean_adc ** 2, 0, None))
+
+    grad_adc = ndimage.generic_gradient_magnitude(adc, ndimage.sobel)
+
+    stacked = np.stack(
+        [dwi, adc, mean_dwi, std_dwi, mean_adc, std_adc, grad_adc], axis=-1
+    )
+    return stacked.reshape(-1, stacked.shape[-1])
+
+
+FEATURE_NAMES = ["DWI", "ADC", "DWI_local_mean", "DWI_local_std",
+                 "ADC_local_mean", "ADC_local_std", "ADC_gradient"]
+
+
+# ---------------------------------------------------------------------------
+# Метрики (те же, что и в остальных baseline — сравнение честное)
+# ---------------------------------------------------------------------------
+
+def dice_coefficient(pred: np.ndarray, target: np.ndarray, eps: float = 1e-6) -> float:
+    pred, target = pred.astype(bool), target.astype(bool)
+    intersection = np.logical_and(pred, target).sum()
+    return (2 * intersection + eps) / (pred.sum() + target.sum() + eps)
+
+
+def iou_score(pred: np.ndarray, target: np.ndarray, eps: float = 1e-6) -> float:
+    pred, target = pred.astype(bool), target.astype(bool)
+    intersection = np.logical_and(pred, target).sum()
+    union = np.logical_or(pred, target).sum()
+    return (intersection + eps) / (union + eps)
+
+
+# ---------------------------------------------------------------------------
+# Наивный пороговый baseline (для сравнения на тех же случаях)
+# ---------------------------------------------------------------------------
+
+def segment_by_threshold(dwi, adc, adc_percentile=15.0, dwi_percentile=85.0):
+    adc_thresh = np.percentile(adc, adc_percentile)
+    dwi_thresh = np.percentile(dwi, dwi_percentile)
+    return ((adc < adc_thresh) & (dwi > dwi_thresh)).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Синтетические данные с варьирующимся контрастом (реалистичнее для сравнения)
+# ---------------------------------------------------------------------------
+
+def make_synthetic_case(size: int = 128, seed: int = 0):
+    rng = np.random.default_rng(seed)
+
+    yy, xx = np.mgrid[0:size, 0:size]
+    cy = rng.uniform(0.3, 0.7) * size
+    cx = rng.uniform(0.3, 0.7) * size
+    ry = rng.uniform(0.06, 0.14) * size
+    rx = rng.uniform(0.06, 0.14) * size
+    lesion = ((yy - cy) / ry) ** 2 + ((xx - cx) / rx) ** 2 <= 1.0
+
+    dwi = rng.normal(loc=100, scale=8, size=(size, size))
+    adc = rng.normal(loc=800, scale=40, size=(size, size))
+
+    # контраст очага варьируется от случая к случаю (слабый/сильный инсульт)
+    contrast = rng.uniform(0.4, 1.0)
+    dwi[lesion] += rng.normal(loc=60 * contrast, scale=10, size=lesion.sum())
+    adc[lesion] -= rng.normal(loc=350 * contrast, scale=30, size=lesion.sum())
+
+    return dwi, adc, lesion.astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Обучение и оценка
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    N_TRAIN_CASES = 12
+    N_TEST_CASES = 6
+
+    # --- обучающая выборка ---
+    train_features, train_labels = [], []
+    for seed in range(N_TRAIN_CASES):
+        dwi, adc, mask = make_synthetic_case(seed=seed)
+        train_features.append(extract_features(dwi, adc))
+        train_labels.append(mask.reshape(-1))
+    X_train = np.concatenate(train_features, axis=0)
+    y_train = np.concatenate(train_labels, axis=0)
+
+    clf = RandomForestClassifier(
+        n_estimators=150, max_depth=10, class_weight="balanced",
+        n_jobs=-1, random_state=0,
+    )
+    clf.fit(X_train, y_train)
+
+    # --- важность признаков ---
+    print("Важность признаков:")
+    for name, imp in sorted(zip(FEATURE_NAMES, clf.feature_importances_),
+                             key=lambda t: -t[1]):
+        print(f"  {name:16s} {imp:.3f}")
+
+    # --- тестовая выборка: сравнение ML vs порог ---
+    ml_dice, ml_iou, thr_dice, thr_iou = [], [], [], []
+    for seed in range(1000, 1000 + N_TEST_CASES):
+        dwi, adc, mask = make_synthetic_case(seed=seed)
+
+        feats = extract_features(dwi, adc)
+        pred_ml = clf.predict(feats).reshape(mask.shape)
+        pred_thr = segment_by_threshold(dwi, adc)
+
+        ml_dice.append(dice_coefficient(pred_ml, mask))
+        ml_iou.append(iou_score(pred_ml, mask))
+        thr_dice.append(dice_coefficient(pred_thr, mask))
+        thr_iou.append(iou_score(pred_thr, mask))
+
+    print(f"\nТестовых случаев: {N_TEST_CASES}")
+    print(f"{'Метод':20s} {'Dice':>8s} {'IoU':>8s}")
+    print(f"{'Порог (наивный)':20s} {np.mean(thr_dice):8.3f} {np.mean(thr_iou):8.3f}")
+    print(f"{'RandomForest (ML)':20s} {np.mean(ml_dice):8.3f} {np.mean(ml_iou):8.3f}")
