@@ -1,26 +1,18 @@
 """
 Обучение и проверка ML baseline (DWI+ADC+FLAIR -> RandomForest) на РЕАЛЬНОМ
-датасете ISLES-2022 (BIDS-структура), а не на синтетике.
+датасете ISLES-2022, а не на синтетике.
 
-ОЖИДАЕМАЯ СТРУКТУРА (как в оригинальном датасете ISLES-2022):
+Скрипт НЕ требует конкретной структуры папок (rawdata/derivatives и т.п.) —
+он рекурсивно ищет по всей папке --data-dir файлы с именами вида:
 
-    <data_dir>/
-        rawdata/
-            sub-strokecase0001/
-                ses-0001/
-                    dwi/
-                        sub-strokecase0001_ses-0001_dwi.nii.gz
-                        sub-strokecase0001_ses-0001_adc.nii.gz
-                    anat/
-                        sub-strokecase0001_ses-0001_FLAIR.nii.gz
-            sub-strokecase0002/
-                ...
-        derivatives/
-            sub-strokecase0001/
-                ses-0001/
-                    sub-strokecase0001_ses-0001_msk.nii.gz
-            sub-strokecase0002/
-                ...
+    <case_id>_dwi.nii.gz  (или .npy)
+    <case_id>_adc.nii.gz
+    <case_id>_FLAIR.nii.gz   (необязательно, если --no-flair)
+    <case_id>_msk.nii.gz
+
+где <case_id> — любая общая часть имени файла до "_dwi"/"_adc"/"_FLAIR"/"_msk"
+(например "sub-strokecase0001_ses-0001"). Файлы группируются по этому
+префиксу, независимо от того, в каких вложенных папках они лежат.
 
 Данные должны лежать ЛОКАЛЬНО (скачайте папку с Google Диска на машину,
 где будете обучать модель — сам скрипт с Google Диском не работает,
@@ -39,6 +31,7 @@
 
 import argparse
 import random
+import re
 from pathlib import Path
 
 import numpy as np
@@ -67,62 +60,45 @@ def load_volume(path: Path) -> np.ndarray:
     raise ValueError(f"Неизвестный формат файла: {path}")
 
 
-def _first_existing(*candidates: Path):
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
+# Имя файла вида "<case_id>_dwi.nii.gz" / "<case_id>_msk.npy" и т.п.
+_MODALITY_RE = re.compile(
+    r"^(?P<case_id>.+)_(?P<modality>dwi|adc|flair|msk)\.(?:nii\.gz|nii|npy)$",
+    re.IGNORECASE,
+)
 
 
 def discover_cases(data_dir: Path, require_flair: bool) -> list:
     """
-    Находит все случаи в структуре ISLES-2022:
-    <data_dir>/rawdata/sub-strokecaseXXXX/ses-0001/{dwi,anat}/...
-    <data_dir>/derivatives/sub-strokecaseXXXX/ses-0001/..._msk.nii.gz
-
-    Принимает файлы как в .nii.gz, так и в .npy (для отладки без nibabel).
+    Рекурсивно обходит data_dir, ищет файлы <case_id>_{dwi,adc,flair,msk}.*
+    в любых подпапках и группирует их по case_id.
     """
-    rawdata_dir = data_dir / "rawdata"
-    derivatives_dir = data_dir / "derivatives"
-    if not rawdata_dir.exists() or not derivatives_dir.exists():
-        raise SystemExit(
-            f"Не найдены папки rawdata/ и derivatives/ внутри {data_dir}. "
-            "Проверьте, что путь указывает на корень ISLES-2022."
-        )
+    found: dict = {}  # case_id -> {"dwi": path, "adc": path, ...}
+    for path in data_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        m = _MODALITY_RE.match(path.name)
+        if not m:
+            continue
+        case_id = m.group("case_id")
+        modality = m.group("modality").lower()
+        found.setdefault(case_id, {})[modality] = path
 
     cases = []
-    for sub_dir in sorted(p for p in rawdata_dir.iterdir() if p.is_dir()):
-        case_id = sub_dir.name  # например, sub-strokecase0001
-        ses_dirs = sorted(p for p in sub_dir.iterdir() if p.is_dir())
-        if not ses_dirs:
-            continue
-        ses_dir = ses_dirs[0]  # берём первую (обычно единственную) сессию
-        ses_id = ses_dir.name  # ses-0001
-
-        dwi_stem = ses_dir / "dwi" / f"{case_id}_{ses_id}_dwi"
-        adc_stem = ses_dir / "dwi" / f"{case_id}_{ses_id}_adc"
-        flair_stem = ses_dir / "anat" / f"{case_id}_{ses_id}_FLAIR"
-        mask_stem = derivatives_dir / case_id / ses_id / f"{case_id}_{ses_id}_msk"
-
-        dwi_path = _first_existing(dwi_stem.with_suffix(".nii.gz"), dwi_stem.with_suffix(".npy"))
-        adc_path = _first_existing(adc_stem.with_suffix(".nii.gz"), adc_stem.with_suffix(".npy"))
-        flair_path = _first_existing(flair_stem.with_suffix(".nii.gz"), flair_stem.with_suffix(".npy"))
-        mask_path = _first_existing(mask_stem.with_suffix(".nii.gz"), mask_stem.with_suffix(".npy"))
-
-        if dwi_path is None or adc_path is None:
+    for case_id, files in sorted(found.items()):
+        if "dwi" not in files or "adc" not in files:
             print(f"[пропуск] {case_id}: не хватает dwi/adc")
             continue
-        if mask_path is None:
-            print(f"[пропуск] {case_id}: нет маски в derivatives/")
+        if "msk" not in files:
+            print(f"[пропуск] {case_id}: нет маски (_msk)")
             continue
-        if require_flair and flair_path is None:
+        if require_flair and "flair" not in files:
             print(f"[пропуск] {case_id}: нет FLAIR (используйте --no-flair)")
             continue
 
         cases.append({
             "case_id": case_id,
-            "dwi": dwi_path, "adc": adc_path,
-            "mask": mask_path, "flair": flair_path,
+            "dwi": files["dwi"], "adc": files["adc"],
+            "mask": files["msk"], "flair": files.get("flair"),
         })
     return cases
 
